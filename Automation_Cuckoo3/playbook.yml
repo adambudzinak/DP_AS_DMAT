@@ -1,0 +1,344 @@
+---
+# Cuckoo3 deployment via the upstream quickstart script.
+# Run with: sudo ./bootstrap.sh
+
+- name: Cuckoo3 quickstart deployment
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+
+  vars:
+    # Linux user that owns the Cuckoo3 install. Loses sudo at the end of
+    # this playbook.
+    cuckoo_username: cuckoo
+
+    # Generated once on first run, kept in this file afterwards.
+    cuckoo_password_store: /root/.cuckoo3_bootstrap_password
+
+    # Answers fed to the upstream quickstart prompts.
+    cuckoo_create_user: true
+    cuckoo_create_default_vms: true
+    cuckoo_static_root: /opt/cuckoo3/static
+
+    cuckoo_quickstart_src: files/quickstart.sh
+    cuckoo_quickstart_dst: /tmp/cuckoo3-quickstart.sh
+
+    # Created at the end of a successful run; presence skips the quickstart
+    # task on later runs.
+    cuckoo_install_marker: /opt/cuckoo3/.quickstart_done
+
+    # When true, port 80 is restricted to RFC 1918 source addresses.
+    cuckoo_limit_web_to_rfc1918: true
+    cuckoo_web_allow_sources:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+
+  handlers:
+    - name: restart ssh
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+  pre_tasks:
+
+    - name: Verify Ubuntu 22.04 or newer
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version is version('22.04', '>=')
+        fail_msg: >
+          Ubuntu 22.04 or newer is required.
+          Detected: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+
+    - name: Stat bootstrap password file
+      ansible.builtin.stat:
+        path: "{{ cuckoo_password_store }}"
+      register: _pwfile
+
+    - name: Read existing bootstrap password
+      ansible.builtin.slurp:
+        src: "{{ cuckoo_password_store }}"
+      register: _pwslurp
+      when: _pwfile.stat.exists
+      no_log: true
+
+    - name: Set password fact from stored file
+      ansible.builtin.set_fact:
+        cuckoo_password: "{{ _pwslurp.content | b64decode | trim }}"
+      when: _pwfile.stat.exists
+      no_log: true
+
+    - name: Generate bootstrap password
+      ansible.builtin.set_fact:
+        cuckoo_password: >-
+          {{ lookup('ansible.builtin.password', '/dev/null',
+             length=24, chars=['ascii_letters', 'digits']) }}
+      when: not _pwfile.stat.exists
+      no_log: true
+
+    - name: Persist bootstrap password (root-only)
+      ansible.builtin.copy:
+        dest: "{{ cuckoo_password_store }}"
+        content: "{{ cuckoo_password }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      when: not _pwfile.stat.exists
+      no_log: true
+
+  tasks:
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        state: present
+        name:
+          - curl
+          - ca-certificates
+          - sudo
+          - gnupg
+          - software-properties-common
+          - expect
+          - openssh-server
+          - git
+          - unzip
+          - ufw
+          - fail2ban
+
+    - name: Enable SSH
+      ansible.builtin.systemd:
+        name: ssh
+        enabled: true
+        state: started
+
+    - name: Disable SSH root login
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin\s+'
+        line: PermitRootLogin no
+      notify: restart ssh
+
+    - name: Create install marker directory
+      ansible.builtin.file:
+        path: /opt/cuckoo3
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy bundled quickstart to host
+      ansible.builtin.copy:
+        src: "{{ cuckoo_quickstart_src }}"
+        dest: "{{ cuckoo_quickstart_dst }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Strip foreground debug run from quickstart
+      # The upstream script ends with an interactive cuckoo run. Strip it
+      # so the wrapper can continue past this point.
+      ansible.builtin.replace:
+        path: "{{ cuckoo_quickstart_dst }}"
+        regexp: '(?ms)^generate_section_header "Running cuckoo in debug mode".*$'
+        replace: |
+          # Foreground debug run removed; cuckoo-core.service handles startup.
+
+    - name: Run quickstart non-interactively
+      # If a prompt changes upstream, expect will not match, the task times
+      # out at 3600 s, and the last prompt will be in the log file.
+      ansible.builtin.shell: |
+        /usr/bin/expect <<'EXPECT' | tee /var/log/cuckoo3-quickstart.log
+        log_user 1
+        set timeout 3600
+
+        spawn /bin/bash {{ cuckoo_quickstart_dst }}
+
+        expect {
+          -re {Would you like to create a new Cuckoo3 user\? \[y/n\]:\s*} {
+            send "{{ 'y' if cuckoo_create_user else 'n' }}\r"
+            exp_continue
+          }
+          -re {Please enter a nameuser for Cuckoo user:\s*} {
+            send "{{ cuckoo_username }}\r"
+            exp_continue
+          }
+          -re {Please enter another username for Cuckoo user:\s*} {
+            send "{{ cuckoo_username }}\r"
+            exp_continue
+          }
+          -re {Please enter the name of the existing user you would like to use for Cuckoo:\s*} {
+            send "{{ cuckoo_username }}\r"
+            exp_continue
+          }
+          -re {Please enter a password for '.*':\s*} {
+            send "{{ cuckoo_password }}\r"
+            exp_continue
+          }
+          -re {Please enter the password for '.*':\s*} {
+            send "{{ cuckoo_password }}\r"
+            exp_continue
+          }
+          -re {Would you like VMCloak to create default VMs\? \(y/n\):\s*} {
+            send "{{ 'y' if cuckoo_create_default_vms else 'n' }}\r"
+            exp_continue
+          }
+          -re {Please enter the full path of Cuckoo static root.*:\s*} {
+            send "{{ '' if cuckoo_static_root == '/opt/cuckoo3/static' else cuckoo_static_root }}\r"
+            exp_continue
+          }
+          timeout {
+            send_user "\nNo matching prompt before timeout. See /var/log/cuckoo3-quickstart.log\n"
+            exit 1
+          }
+          eof
+        }
+        EXPECT
+      args:
+        executable: /bin/bash
+        creates: "{{ cuckoo_install_marker }}"
+      no_log: true
+
+    - name: Write install marker
+      ansible.builtin.file:
+        path: "{{ cuckoo_install_marker }}"
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Remove analysis user from sudo group
+      ansible.builtin.command: "gpasswd -d {{ cuckoo_username }} sudo"
+      register: _sudodrop
+      changed_when: "'Removing user' in _sudodrop.stdout"
+      failed_when: false
+
+    - name: Install cuckoo-core.service
+      # The upstream quickstart sets up cuckoo-web.service (Daphne/ASGI)
+      # and nginx. This unit covers the main cuckoo process.
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cuckoo-core.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Cuckoo3 core analysis engine
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ cuckoo_username }}
+          Group={{ cuckoo_username }}
+          WorkingDirectory=/home/{{ cuckoo_username }}/cuckoo3
+          Environment=HOME=/home/{{ cuckoo_username }}
+          Environment=CUCKOO_CWD=/home/{{ cuckoo_username }}/.cuckoocwd
+          Environment=PATH=/home/{{ cuckoo_username }}/cuckoo3/venv/bin:/usr/local/bin:/usr/bin:/bin
+          ExecStart=/home/{{ cuckoo_username }}/cuckoo3/venv/bin/cuckoo
+          Restart=on-failure
+          RestartSec=10
+          LimitNOFILE=65535
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: reload systemd
+
+    - name: Enable and start cuckoo-core
+      ansible.builtin.systemd:
+        name: cuckoo-core.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: UFW default deny incoming
+      community.general.ufw:
+        direction: incoming
+        policy: deny
+
+    - name: UFW allow SSH
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: UFW allow web from RFC 1918 sources
+      community.general.ufw:
+        rule: allow
+        src: "{{ item }}"
+        port: '80'
+        proto: tcp
+      loop: "{{ cuckoo_web_allow_sources }}"
+      when: cuckoo_limit_web_to_rfc1918
+
+    - name: UFW enable
+      community.general.ufw:
+        state: enabled
+
+    - name: Enable fail2ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    - name: Check cuckoo-core service status
+      ansible.builtin.command: systemctl is-active cuckoo-core.service
+      register: _core_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check cuckoo binary runs as the analysis user
+      ansible.builtin.command: >
+        su - {{ cuckoo_username }} -c
+        "/home/{{ cuckoo_username }}/cuckoo3/venv/bin/cuckoo --version"
+      register: _cuckoo_version
+      changed_when: false
+      failed_when: false
+
+    - name: Record deployed git commit hashes
+      ansible.builtin.shell: |
+        for repo in cuckoo3 vmcloak; do
+          dir="/home/{{ cuckoo_username }}/$repo"
+          if [[ -d "$dir/.git" ]]; then
+            echo "$repo: $(git -C $dir log -1 --format='%H  %ci')"
+          else
+            echo "$repo: not found at $dir"
+          fi
+        done
+      register: _commits
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Write deployment report
+      ansible.builtin.copy:
+        dest: /root/CUCKOO3_DEPLOYMENT.txt
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Cuckoo3 deployment finished {{ ansible_date_time.iso8601 }}
+
+          Host       : {{ ansible_hostname }}
+          OS         : {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Kernel     : {{ ansible_kernel }}
+          RAM        : {{ ansible_memtotal_mb }} MB
+          CPUs       : {{ ansible_processor_vcpus }}
+          IP         : {{ ansible_default_ipv4.address | default('unknown') }}
+
+          Analysis user  : {{ cuckoo_username }}
+          Password file  : {{ cuckoo_password_store }}
+          Install marker : {{ cuckoo_install_marker }}
+          Quickstart log : /var/log/cuckoo3-quickstart.log
+          Web interface  : http://{{ ansible_default_ipv4.address | default('HOST-IP') }}/
+
+          cuckoo-core service : {{ _core_status.stdout | default('unknown') }}
+          cuckoo binary check : {{ 'ok' if _cuckoo_version.rc == 0 else 'failed' }}
+
+          Deployed git commits:
+          {{ _commits.stdout | indent(2) }}
