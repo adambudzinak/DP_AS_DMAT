@@ -102,7 +102,7 @@ All variables sit at the top of `playbook.yml` under `vars:`.
 | `cuckoo_existing_iso` | `""` (empty) | Path to a local Windows ISO to reuse |
 | `cuckoo_limit_web_to_rfc1918` | `true` | Restrict web port 80 to RFC 1918 sources |
 
-## Idempotency
+## Re-running the playbook
 
 The quickstart task uses `creates: {{ cuckoo_install_marker }}` as a guard.
 Re-running the playbook after a successful install skips the quickstart
@@ -137,6 +137,6 @@ hashes are recorded in the deployment report.
 | `/var/log/cuckoo3-quickstart.log` | Full quickstart output |
 | `/opt/cuckoo3/.quickstart_done` | Install marker |
 
-## Licence
+## License
 
-MIT.
+MIT. See `LICENSE`.
