@@ -17,7 +17,7 @@ After installation, open the web interface URL printed in the final summary.
 ## Requirements
 
 * Ubuntu 22.04 LTS
-* 4+ CPU cores with VT-x or AMD-V, 8 GB RAM, 80 GB disk
+* Recommended: 4+ CPU cores with VT-x or AMD-V, 8 GB RAM, 150+ GB disk
 * Internet access during installation
 * If reusing an ISO, the file in the path you configure
 
