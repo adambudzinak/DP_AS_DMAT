@@ -33,7 +33,7 @@ wait_for_apt
 apt-get install -y ansible python3-apt
 
 # community.general provides the ufw module used in the playbook
-ansible-galaxy collection install -q community.general
+ansible-galaxy collection install community.general
 
 ansible-playbook -i localhost, -c local playbook.yml
 
