@@ -24,9 +24,15 @@
     cuckoo_quickstart_src: files/quickstart.sh
     cuckoo_quickstart_dst: /tmp/cuckoo3-quickstart.sh
 
-    # Created at the end of a successful run; presence skips the quickstart
+    # Created at the end of a successful run. Presence skips the quickstart
     # task on later runs.
     cuckoo_install_marker: /opt/cuckoo3/.quickstart_done
+
+    # Optional: path to a pre-downloaded Windows 10 x64 ISO. If set and the
+    # file exists, the playbook copies it to /home/<user>/win10x64.iso before
+    # the quickstart runs. VMCloak then skips the download.
+    # See README for details.
+    cuckoo_existing_iso: ""
 
     # When true, port 80 is restricted to RFC 1918 source addresses.
     cuckoo_limit_web_to_rfc1918: true
@@ -34,6 +40,11 @@
       - 10.0.0.0/8
       - 172.16.0.0/12
       - 192.168.0.0/16
+
+    # Path where Cuckoo writes node info after cuckoo-core starts. The web
+    # service needs this file to exist before it starts, otherwise sample
+    # uploads fail with a node not found error.
+    cuckoo_nodeinfo_path: "/home/{{ cuckoo_username }}/.cuckoocwd/operational/generated/nodeinfos.json"
 
   handlers:
     - name: restart ssh
@@ -55,6 +66,10 @@
         fail_msg: >
           Ubuntu 22.04 or newer is required.
           Detected: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+
+    - name: Capture sudo user for desktop copy
+      ansible.builtin.set_fact:
+        _sudo_user: "{{ lookup('env', 'SUDO_USER') | default('', true) }}"
 
     - name: Stat bootstrap password file
       ansible.builtin.stat:
@@ -133,6 +148,33 @@
         group: root
         mode: "0755"
 
+    # If an existing ISO is supplied, put it where VMCloak looks first.
+    - name: Stat existing ISO if path is set
+      ansible.builtin.stat:
+        path: "{{ cuckoo_existing_iso }}"
+      register: _existing_iso_stat
+      when: cuckoo_existing_iso | length > 0
+
+    - name: Ensure cuckoo home directory exists for ISO placement
+      ansible.builtin.file:
+        path: "/home/{{ cuckoo_username }}"
+        state: directory
+        mode: "0755"
+      when:
+        - cuckoo_existing_iso | length > 0
+        - _existing_iso_stat.stat.exists | default(false)
+      failed_when: false
+
+    - name: Copy existing ISO to VMCloak expected location
+      ansible.builtin.copy:
+        src: "{{ cuckoo_existing_iso }}"
+        dest: "/home/{{ cuckoo_username }}/win10x64.iso"
+        mode: "0644"
+        remote_src: true
+      when:
+        - cuckoo_existing_iso | length > 0
+        - _existing_iso_stat.stat.exists | default(false)
+
     - name: Copy bundled quickstart to host
       ansible.builtin.copy:
         src: "{{ cuckoo_quickstart_src }}"
@@ -142,17 +184,25 @@
         mode: "0755"
 
     - name: Strip foreground debug run from quickstart
-      # The upstream script ends with an interactive cuckoo run. Strip it
-      # so the wrapper can continue past this point.
+      # The upstream script ends with an interactive cuckoo run. Remove it
+      # so the playbook can continue to service setup.
       ansible.builtin.replace:
         path: "{{ cuckoo_quickstart_dst }}"
         regexp: '(?ms)^generate_section_header "Running cuckoo in debug mode".*$'
         replace: |
           # Foreground debug run removed; cuckoo-core.service handles startup.
 
+    - name: Show progress notice before long install
+      ansible.builtin.debug:
+        msg:
+          - "Quickstart is starting. This takes 30 to 90 minutes."
+          - "Monitor live: tail -f /var/log/cuckoo3-quickstart.log"
+          - "If VMCloak downloads the Windows ISO it can take 10 to 30 minutes extra."
+
     - name: Run quickstart non-interactively
-      # If a prompt changes upstream, expect will not match, the task times
-      # out at 3600 s, and the last prompt will be in the log file.
+      # Password goes into the rendered script. Ansible only prints script
+      # content at -vvv verbosity, so this is safe at normal verbosity.
+      # The creates: guard makes the task idempotent.
       ansible.builtin.shell: |
         /usr/bin/expect <<'EXPECT' | tee /var/log/cuckoo3-quickstart.log
         log_user 1
@@ -203,7 +253,6 @@
       args:
         executable: /bin/bash
         creates: "{{ cuckoo_install_marker }}"
-      no_log: true
 
     - name: Write install marker
       ansible.builtin.file:
@@ -257,6 +306,26 @@
         state: started
         daemon_reload: true
 
+    # cuckoo-core must produce nodeinfos.json before cuckoo-web starts.
+    # Without this, sample uploads fail because the web layer cannot resolve
+    # the analysis node. Restart core to be sure it picks up the latest config,
+    # wait for the dump, then restart web on top of it.
+    - name: Restart cuckoo-core after configuration
+      ansible.builtin.systemd:
+        name: cuckoo-core.service
+        state: restarted
+
+    - name: Wait for cuckoo node info dump
+      ansible.builtin.wait_for:
+        path: "{{ cuckoo_nodeinfo_path }}"
+        timeout: 120
+
+    - name: Restart cuckoo-web after node info exists
+      ansible.builtin.systemd:
+        name: cuckoo-web.service
+        state: restarted
+      failed_when: false
+
     - name: UFW default deny incoming
       community.general.ufw:
         direction: incoming
@@ -292,6 +361,12 @@
       changed_when: false
       failed_when: false
 
+    - name: Check cuckoo-web service status
+      ansible.builtin.command: systemctl is-active cuckoo-web.service
+      register: _web_status
+      changed_when: false
+      failed_when: false
+
     - name: Check cuckoo binary runs as the analysis user
       ansible.builtin.command: >
         su - {{ cuckoo_username }} -c
@@ -301,11 +376,16 @@
       failed_when: false
 
     - name: Record deployed git commit hashes
+      # Run as the cuckoo user so git does not complain about dubious
+      # ownership when reading repositories owned by another user.
+      become: true
+      become_user: "{{ cuckoo_username }}"
       ansible.builtin.shell: |
         for repo in cuckoo3 vmcloak; do
           dir="/home/{{ cuckoo_username }}/$repo"
           if [[ -d "$dir/.git" ]]; then
-            echo "$repo: $(git -C $dir log -1 --format='%H  %ci')"
+            commit=$(git -C "$dir" log -1 --format='%H  %ci' 2>/dev/null || echo 'read failed')
+            echo "$repo: $commit"
           else
             echo "$repo: not found at $dir"
           fi
@@ -320,7 +400,7 @@
         dest: /root/CUCKOO3_DEPLOYMENT.txt
         owner: root
         group: root
-        mode: "0600"
+        mode: "0644"
         content: |
           Cuckoo3 deployment finished {{ ansible_date_time.iso8601 }}
 
@@ -331,14 +411,75 @@
           CPUs       : {{ ansible_processor_vcpus }}
           IP         : {{ ansible_default_ipv4.address | default('unknown') }}
 
+          Web interface  : http://{{ ansible_default_ipv4.address | default('HOST-IP') }}/
           Analysis user  : {{ cuckoo_username }}
           Password file  : {{ cuckoo_password_store }}
           Install marker : {{ cuckoo_install_marker }}
           Quickstart log : /var/log/cuckoo3-quickstart.log
-          Web interface  : http://{{ ansible_default_ipv4.address | default('HOST-IP') }}/
 
           cuckoo-core service : {{ _core_status.stdout | default('unknown') }}
+          cuckoo-web service  : {{ _web_status.stdout | default('unknown') }}
           cuckoo binary check : {{ 'ok' if _cuckoo_version.rc == 0 else 'failed' }}
 
           Deployed git commits:
           {{ _commits.stdout | indent(2) }}
+
+    - name: Check sudo user desktop directory
+      ansible.builtin.stat:
+        path: "/home/{{ _sudo_user }}/Desktop"
+      register: _desktop_stat
+      when: _sudo_user | length > 0
+
+    - name: Copy deployment report to sudo user desktop
+      ansible.builtin.copy:
+        src: /root/CUCKOO3_DEPLOYMENT.txt
+        dest: "/home/{{ _sudo_user }}/Desktop/CUCKOO3_DEPLOYMENT.txt"
+        owner: "{{ _sudo_user }}"
+        group: "{{ _sudo_user }}"
+        mode: "0644"
+        remote_src: true
+      register: _report_copy_desktop
+      when:
+        - _sudo_user | length > 0
+        - _desktop_stat.stat.exists | default(false)
+
+    - name: Copy deployment report to sudo user home (fallback)
+      ansible.builtin.copy:
+        src: /root/CUCKOO3_DEPLOYMENT.txt
+        dest: "/home/{{ _sudo_user }}/CUCKOO3_DEPLOYMENT.txt"
+        owner: "{{ _sudo_user }}"
+        group: "{{ _sudo_user }}"
+        mode: "0644"
+        remote_src: true
+      when:
+        - _sudo_user | length > 0
+        - not (_desktop_stat.stat.exists | default(false))
+
+    - name: Resolve final report path for summary
+      ansible.builtin.set_fact:
+        _final_report_path: >-
+          {%- if _sudo_user | length > 0 and _desktop_stat.stat.exists | default(false) -%}
+          /home/{{ _sudo_user }}/Desktop/CUCKOO3_DEPLOYMENT.txt
+          {%- elif _sudo_user | length > 0 -%}
+          /home/{{ _sudo_user }}/CUCKOO3_DEPLOYMENT.txt
+          {%- else -%}
+          /root/CUCKOO3_DEPLOYMENT.txt
+          {%- endif -%}
+
+    - name: Show completion summary
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "  Cuckoo3 deployment complete."
+          - ""
+          - "  Web interface : http://{{ ansible_default_ipv4.address | default('HOST-IP') }}/"
+          - "  Analysis user : {{ cuckoo_username }}"
+          - "  Password file : {{ cuckoo_password_store }}"
+          - ""
+          - "  Service status:"
+          - "    cuckoo-core : {{ _core_status.stdout | default('unknown') }}"
+          - "    cuckoo-web  : {{ _web_status.stdout | default('unknown') }}"
+          - ""
+          - "  Deployment report: {{ _final_report_path | trim }}"
+          - ""
+          - "  Open the web interface and upload a sample to test the install."
