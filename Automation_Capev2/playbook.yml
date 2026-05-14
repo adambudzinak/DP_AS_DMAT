@@ -14,15 +14,10 @@
     cape_username: cape
 
     cape_password_store: /root/.cape_bootstrap_password
-    cape_repo_url: "https://github.com/kevoreilly/CAPEv2.git"
+    cape_repo_url: "https://github.com/adambudzinak/CAPEv2.git"
     cape_repo_dest: /opt/CAPEv2
-    # CAPE is rolling-released and the master branch can change several
-    # times a day. Pinning a commit hash here keeps two runs on different
-    # days from installing different code. Set this to "master" to track
-    # upstream instead, and expect occasional breakage when you do.
-    # To list recent commits:
-    #   git ls-remote https://github.com/kevoreilly/CAPEv2.git
-    cape_repo_version: dd36c30f22ae3c41293fc3d27d8a2c28f8fa8206 # verified 2026-05-14
+    # Uses my fork's master branch.
+    cape_repo_version: master # verified 2026-05-14
 
     cape_log_dir: /var/log/cape-install
     cape_kvm_log: "{{ cape_log_dir }}/kvm-qemu.log"
