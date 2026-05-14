@@ -1,0 +1,929 @@
+---
+# CAPEv2 deployment via the official kvm-qemu.sh and cape2.sh installers.
+# Run with: sudo ./bootstrap.sh
+
+- name: CAPEv2 deployment
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+
+  vars:
+    # Linux user that owns the CAPE install. CAPE services run as this user
+    # (except cape-rooter, which must run as root).
+    cape_username: cape
+
+    cape_password_store: /root/.cape_bootstrap_password
+    cape_repo_url: "https://github.com/kevoreilly/CAPEv2.git"
+    cape_repo_dest: /opt/CAPEv2
+    # CAPE is rolling-released and the master branch can change several
+    # times a day. Pinning a commit hash here keeps two runs on different
+    # days from installing different code. Set this to "master" to track
+    # upstream instead, and expect occasional breakage when you do.
+    # To list recent commits:
+    #   git ls-remote https://github.com/kevoreilly/CAPEv2.git
+    cape_repo_version: dd36c30f22ae3c41293fc3d27d8a2c28f8fa8206 # verified 2026-05-14
+
+    cape_log_dir: /var/log/cape-install
+    cape_kvm_log: "{{ cape_log_dir }}/kvm-qemu.log"
+    cape_base_log: "{{ cape_log_dir }}/cape.log"
+
+    # Idempotency markers. Each long installer is gated by its own marker.
+    cape_kvm_marker: /root/.cape_kvm_done
+    cape_base_marker: /root/.cape_base_done
+
+    cape_tmux_kvm: cape_kvm_setup
+    cape_tmux_base: cape_base_setup
+
+    # cape2.sh installs Poetry to /etc/poetry. The venv is managed entirely
+    # by Poetry; never call .venv/bin/python or .venv/bin/pip directly.
+    # Use `poetry run python` and `poetry run pip` instead.
+    cape_poetry_bin: /etc/poetry/bin/poetry
+    cape_poetry_run: /etc/poetry/bin/poetry run
+
+    # Maximum wait time per installer stage (in 10s units).
+    # 360 retries x 10s = 1 hour per stage.
+    cape_installer_retries: 360
+
+    # When true, port 8000 is restricted to RFC 1918 source addresses.
+    cape_limit_web_to_rfc1918: true
+    cape_web_allow_sources:
+      - 10.0.0.0/8
+      - 172.16.0.0/12
+      - 192.168.0.0/16
+
+    cape_report_file: /root/CAPE_DEPLOYMENT.txt
+
+  handlers:
+    - name: restart ssh
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+  pre_tasks:
+
+    - name: Verify Ubuntu 22.04 or newer
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_version is version('22.04', '>=')
+        fail_msg: >
+          Ubuntu 22.04 or newer is required.
+          Detected: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+
+    - name: Note Ubuntu version
+      ansible.builtin.debug:
+        msg: "Deploying on Ubuntu {{ ansible_distribution_version }}."
+      when: false  # informational only; assertion above already gates the version
+
+    - name: Capture sudo user for desktop copy
+      ansible.builtin.set_fact:
+        _sudo_user: "{{ lookup('env', 'SUDO_USER') | default('', true) }}"
+
+    - name: Check for conflicting custom libvirt installation
+      # CAPE installers conflict with libvirt files placed under /usr/local
+      # by manual builds. Catch this early.
+      ansible.builtin.shell: |
+        find /usr/local/lib \( -name 'libvirt*' -o -path '/usr/local/lib/python3*/dist-packages/libvirt*' \) 2>/dev/null
+      register: _libvirt_conflict
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Fail if custom libvirt installation is present
+      ansible.builtin.fail:
+        msg: >
+          Custom libvirt files found under /usr/local. Remove them before
+          running this playbook, otherwise libvirt and CAPE will conflict.
+          Found:
+          {{ _libvirt_conflict.stdout }}
+      when: _libvirt_conflict.stdout | trim | length > 0
+
+    - name: Stat bootstrap password file
+      ansible.builtin.stat:
+        path: "{{ cape_password_store }}"
+      register: _pwfile
+
+    - name: Read existing bootstrap password
+      ansible.builtin.slurp:
+        src: "{{ cape_password_store }}"
+      register: _pwslurp
+      when: _pwfile.stat.exists
+      no_log: true
+
+    - name: Set password fact from stored file
+      ansible.builtin.set_fact:
+        cape_password: "{{ _pwslurp.content | b64decode | trim }}"
+      when: _pwfile.stat.exists
+      no_log: true
+
+    - name: Generate bootstrap password
+      ansible.builtin.set_fact:
+        cape_password: >-
+          {{ lookup('ansible.builtin.password', '/dev/null',
+             length=28, chars=['ascii_letters', 'digits']) }}
+      when: not _pwfile.stat.exists
+      no_log: true
+
+    - name: Persist bootstrap password (root-only)
+      ansible.builtin.copy:
+        dest: "{{ cape_password_store }}"
+        content: "{{ cape_password }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+      when: not _pwfile.stat.exists
+      no_log: true
+
+  tasks:
+
+    - name: Create install log directory
+      ansible.builtin.file:
+        path: "{{ cape_log_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Install baseline packages
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        state: present
+        name:
+          - git
+          - tmux
+          - curl
+          - wget
+          - ca-certificates
+          - sudo
+          - acl
+          - gnupg
+          - openssh-server
+          - ufw
+          - fail2ban
+          - python3
+          - python3-venv
+          - python3-pip
+          - python3-apt
+          - build-essential
+          - pkg-config
+          - gcc
+          - python3-dev
+          - libssl-dev
+          - libffi-dev
+          - libjpeg-dev
+          - zlib1g-dev
+          # Build dependencies that kvm-qemu.sh's aptitude calls expect.
+          # kvm-qemu.sh purges apt libvirt/qemu packages and rebuilds them
+          # from source (libvirt 11.x, QEMU 9.x), then apt-mark holds them.
+          # We do NOT pre-install libvirt-daemon, libvirt-daemon-system,
+          # libvirt-clients, qemu-kvm, virt-manager or virtinst because
+          # kvm-qemu.sh handles those itself in its own way.
+          - libvirt-dev
+          - bridge-utils
+          - dnsmasq-base
+          # Guest-side tooling that kvm-qemu.sh does not install but our
+          # virt-install scripts for Win10/Win11 guests require:
+          - ovmf
+          - swtpm
+          - swtpm-tools
+          - cpu-checker
+          # kvm-qemu.sh calls aptitude for all its package installs.
+          # Without it the installer falls back to source builds.
+          - aptitude
+          # kvm-qemu.sh builds libvirt 11.x from source; xsltproc is
+          # required by libvirt's meson build for documentation generation.
+          - xsltproc
+          # kvm-qemu.sh builds QEMU 9.x from source; meson requires
+          # libglib2.0-dev as a mandatory dependency.
+          - libglib2.0-dev
+          # Additional QEMU source build dependencies that aptitude would
+          # have pulled in but that may not be present yet.
+          - libpixman-1-dev
+          - ninja-build
+          - libcap-ng-dev
+          - libattr1-dev
+          - libslirp-dev
+
+    - name: Enable SSH
+      ansible.builtin.systemd:
+        name: ssh
+        enabled: true
+        state: started
+
+    - name: Disable SSH root login
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin\s+'
+        line: PermitRootLogin no
+      notify: restart ssh
+
+    - name: Create libvirt and kvm groups before user setup
+      # libvirt-daemon-system normally creates these groups but we removed
+      # that package from baseline (kvm-qemu.sh rebuilds libvirt from source).
+      # Pre-create them so the user task does not fail. kvm-qemu.sh will
+      # reuse the existing groups when it sets up its source-built libvirt.
+      ansible.builtin.group:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - libvirt
+        - kvm
+
+    - name: Create CAPE user
+      ansible.builtin.user:
+        name: "{{ cape_username }}"
+        shell: /bin/bash
+        create_home: true
+        password: "{{ cape_password | password_hash('sha512') }}"
+        groups: libvirt,kvm
+        append: true
+
+    - name: Add invoking desktop user to libvirt and kvm groups
+      ansible.builtin.user:
+        name: "{{ _sudo_user }}"
+        groups: libvirt,kvm
+        append: true
+      when: _sudo_user | length > 0
+
+    - name: Ensure /opt exists
+      ansible.builtin.file:
+        path: /opt
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Clone CAPEv2 repository
+      ansible.builtin.git:
+        repo: "{{ cape_repo_url }}"
+        dest: "{{ cape_repo_dest }}"
+        version: "{{ cape_repo_version }}"
+        update: true
+
+    - name: Set CAPE repo ownership
+      ansible.builtin.file:
+        path: "{{ cape_repo_dest }}"
+        state: directory
+        recurse: true
+        owner: "{{ cape_username }}"
+        group: "{{ cape_username }}"
+
+    # ---- KVM/QEMU installer stage ----
+    # Long-running script. Run inside tmux so log goes to a file we can tail
+    # from the bootstrap watcher. Marker file gates re-runs.
+
+    - name: Stat kvm-qemu marker
+      ansible.builtin.stat:
+        path: "{{ cape_kvm_marker }}"
+      register: _kvm_marker
+
+    - name: Show kvm-qemu stage notice
+      ansible.builtin.debug:
+        msg:
+          - "kvm-qemu.sh installer starting in tmux session '{{ cape_tmux_kvm }}'."
+          - "Live log: tail -f {{ cape_kvm_log }}"
+          - "Expected duration: 15 to 40 minutes."
+      when: not _kvm_marker.stat.exists
+
+    - name: Start kvm-qemu installer in tmux
+      ansible.builtin.shell: |
+        tmux has-session -t {{ cape_tmux_kvm }} 2>/dev/null && exit 0
+        tmux new-session -d -s {{ cape_tmux_kvm }} \
+          "cd {{ cape_repo_dest }}/installer && bash kvm-qemu.sh all {{ cape_username }} 2>&1 | tee {{ cape_kvm_log }}"
+      args:
+        executable: /bin/bash
+      when: not _kvm_marker.stat.exists
+
+    - name: Wait for kvm-qemu installer to finish
+      ansible.builtin.shell: "tmux has-session -t {{ cape_tmux_kvm }}"
+      register: _kvm_wait
+      retries: "{{ cape_installer_retries }}"
+      delay: 10
+      until: _kvm_wait.rc != 0
+      failed_when: false
+      changed_when: false
+      when: not _kvm_marker.stat.exists
+
+    - name: Stat kvm-qemu log
+      ansible.builtin.stat:
+        path: "{{ cape_kvm_log }}"
+      register: _kvm_log_stat
+
+    - name: Mark kvm-qemu stage complete
+      ansible.builtin.file:
+        path: "{{ cape_kvm_marker }}"
+        state: touch
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - not _kvm_marker.stat.exists
+        - _kvm_log_stat.stat.exists
+        - (_kvm_log_stat.stat.size | default(0) | int) > 0
+
+    # ---- Post-kvm-qemu validation ----
+    # CAPE docs explicitly forbid touching apt libvirt/qemu packages because
+    # kvm-qemu.sh built them from source (libvirt 11.x, QEMU 9.x) and held
+    # them via apt-mark. We do NOT reinstall, unhold, or override anything.
+    # We just verify the daemons started and the default network exists.
+    # See: https://capev2.readthedocs.io/en/latest/installation/host/installation.html
+    # See: kvm-qemu.sh comment "NEVER! ... uninstall qemu and libvirt first"
+
+    - name: Locate QEMU system binary after kvm-qemu.sh
+      # kvm-qemu.sh builds QEMU from source. If the build succeeded the
+      # binary should be in /usr/local/bin or /usr/bin. If neither exists
+      # the source build likely failed; we fall back to the apt qemu-system-x86
+      # package which is compatible with the source-built libvirt 11.x.
+      ansible.builtin.shell: |
+        for p in /usr/local/bin/qemu-system-x86_64                  /usr/bin/qemu-system-x86_64                  /usr/local/bin/qemu-kvm                  /usr/bin/kvm; do
+          if [[ -x "$p" ]]; then
+            echo "$p"
+            exit 0
+          fi
+        done
+        echo ""
+      register: _qemu_bin
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Install apt QEMU if source build left no binary
+      ansible.builtin.apt:
+        name:
+          - qemu-system-x86
+          - qemu-kvm
+        state: present
+        update_cache: false
+      when: _qemu_bin.stdout | trim | length == 0
+
+    - name: Reload udev after kvm-qemu.sh changes
+      # kvm-qemu.sh adjusts /etc/modprobe.d/kvm.conf and udev rules.
+      # Without a udev reload, /dev/kvm may have stale permissions on first run.
+      ansible.builtin.shell: |
+        udevadm control --reload-rules || true
+        udevadm trigger || true
+        modprobe -r kvm_intel 2>/dev/null || modprobe -r kvm_amd 2>/dev/null || true
+        modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+
+    - name: Install virt-install via kvm-qemu.sh virtmanager subcommand
+      # apt virtinst depends on libvirt0 (apt 8.0.0) which conflicts with
+      # the source-built libvirt 11.x that kvm-qemu.sh installed.
+      # The correct way is kvm-qemu.sh's own virtmanager subcommand which
+      # handles the dependency ordering after the source build.
+      ansible.builtin.shell: |
+        bash {{ cape_repo_dest }}/installer/kvm-qemu.sh virtmanager {{ cape_username }}           2>&1 | tee /var/log/cape-install/kvm-virtmanager.log
+      args:
+        executable: /bin/bash
+        creates: /usr/bin/virt-install
+
+    - name: Start any available libvirt daemon (split or monolithic)
+      # kvm-qemu.sh sets up split daemons (virtqemud, virtnetworkd,
+      # virtstoraged) on Ubuntu 22.04+. If those are not enabled, fall
+      # back to monolithic libvirtd. We try both rather than enforce one.
+      ansible.builtin.shell: |
+        # Enable both stacks; whichever exists will start, the other no-op.
+        for unit in virtqemud.socket virtnetworkd.socket virtstoraged.socket \
+                    virtqemud.service virtnetworkd.service virtstoraged.service \
+                    libvirtd.socket libvirtd.service; do
+          systemctl enable "$unit" 2>/dev/null || true
+          systemctl start  "$unit" 2>/dev/null || true
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Wait for libvirt to accept a connection
+      ansible.builtin.shell: "virsh -c qemu:///system list --all"
+      register: _virsh_ok
+      retries: 20
+      delay: 3
+      until: _virsh_ok.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: Show diagnostics if libvirt is not reachable
+      ansible.builtin.debug:
+        msg:
+          - "libvirt is not yet reachable. A reboot is often required after"
+          - "kvm-qemu.sh installs the source-built libvirt 11.x stack."
+          - "After this playbook finishes, reboot the host and run it again."
+          - "The kvm-qemu marker will skip the long install on the next run."
+      when: _virsh_ok.rc != 0
+
+    - name: Ensure default libvirt network exists and is active
+      ansible.builtin.shell: |
+        if ! virsh -c qemu:///system net-info default >/dev/null 2>&1; then
+          if [[ -f /usr/share/libvirt/networks/default.xml ]]; then
+            virsh -c qemu:///system net-define /usr/share/libvirt/networks/default.xml
+          fi
+        fi
+        virsh -c qemu:///system net-start default 2>/dev/null || true
+        virsh -c qemu:///system net-autostart default 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      when: _virsh_ok.rc == 0
+
+    # ---- CAPE base installer stage ----
+
+    - name: Stat cape2 base marker
+      ansible.builtin.stat:
+        path: "{{ cape_base_marker }}"
+      register: _base_marker
+
+    - name: Show cape2 stage notice
+      ansible.builtin.debug:
+        msg:
+          - "cape2.sh base installer starting in tmux session '{{ cape_tmux_base }}'."
+          - "Live log: tail -f {{ cape_base_log }}"
+          - "Expected duration: 10 to 30 minutes."
+      when: not _base_marker.stat.exists
+
+    - name: Start cape2 base installer in tmux
+      ansible.builtin.shell: |
+        tmux has-session -t {{ cape_tmux_base }} 2>/dev/null && exit 0
+        tmux new-session -d -s {{ cape_tmux_base }} \
+          "cd {{ cape_repo_dest }}/installer && bash cape2.sh base 2>&1 | tee {{ cape_base_log }}"
+      args:
+        executable: /bin/bash
+      when: not _base_marker.stat.exists
+
+    - name: Wait for cape2 installer to finish
+      ansible.builtin.shell: "tmux has-session -t {{ cape_tmux_base }}"
+      register: _base_wait
+      retries: "{{ cape_installer_retries }}"
+      delay: 10
+      until: _base_wait.rc != 0
+      failed_when: false
+      changed_when: false
+      when: not _base_marker.stat.exists
+
+    - name: Stat cape2 log
+      ansible.builtin.stat:
+        path: "{{ cape_base_log }}"
+      register: _base_log_stat
+
+    - name: Mark cape2 stage complete
+      ansible.builtin.file:
+        path: "{{ cape_base_marker }}"
+        state: touch
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - not _base_marker.stat.exists
+        - _base_log_stat.stat.exists
+        - (_base_log_stat.stat.size | default(0) | int) > 0
+
+    - name: Re-apply CAPE repo ownership after installers
+      ansible.builtin.file:
+        path: "{{ cape_repo_dest }}"
+        state: directory
+        recurse: true
+        owner: "{{ cape_username }}"
+        group: "{{ cape_username }}"
+
+    # ---- Poetry venv stage ----
+    # Build/repair the Poetry-managed virtualenv after cape2.sh finishes.
+    # Do not assume cape2.sh completed dependency installation: a partial
+    # installer run can leave services present but the venv missing core
+    # packages such as sqlalchemy and pebble.
+
+    - name: Stop CAPE services before Python dependency repair
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - cape.service
+        - cape-processor.service
+        - cape-web.service
+      failed_when: false
+
+    - name: Verify Poetry binary exists
+      ansible.builtin.stat:
+        path: "{{ cape_poetry_bin }}"
+      register: _poetry_stat
+
+    - name: Fail if Poetry is missing
+      ansible.builtin.fail:
+        msg: "Poetry was not found at {{ cape_poetry_bin }}. Check {{ cape_base_log }} for installer errors."
+      when: not _poetry_stat.stat.exists
+
+    - name: Install complete CAPE Poetry dependency set
+      become_user: "{{ cape_username }}"
+      ansible.builtin.shell: |
+        {{ cape_poetry_bin }} install --no-interaction
+      args:
+        chdir: "{{ cape_repo_dest }}"
+        executable: /bin/bash
+      environment:
+        HOME: "/home/{{ cape_username }}"
+        PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
+
+    - name: Install CAPE runtime Python packages
+      become_user: "{{ cape_username }}"
+      ansible.builtin.shell: |
+        {{ cape_poetry_run }} pip install pytz pyzipper setproctitle django libvirt-python
+      args:
+        chdir: "{{ cape_repo_dest }}"
+        executable: /bin/bash
+      environment:
+        HOME: "/home/{{ cape_username }}"
+        PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
+
+    - name: Install CAPE helper Python packages
+      # These packages are referenced by CAPE processing modules.
+      become_user: "{{ cape_username }}"
+      ansible.builtin.shell: |
+        {{ cape_poetry_run }} pip install \
+          git+https://github.com/CAPESandbox/httpreplay \
+          git+https://github.com/DissectMalware/batch_deobfuscator \
+          certvalidator asn1crypto mscerts
+      args:
+        chdir: "{{ cape_repo_dest }}"
+        executable: /bin/bash
+      environment:
+        HOME: "/home/{{ cape_username }}"
+        PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
+
+    # ---- Runtime validation ----
+
+    - name: Verify CAPE runtime imports
+      become_user: "{{ cape_username }}"
+      ansible.builtin.shell: |
+        {{ cape_poetry_run }} python -c "import sqlalchemy, pebble, pytz, django, setproctitle, pyzipper, libvirt; print('OK')"
+      register: _py_check
+      changed_when: false
+      failed_when: false
+      args:
+        chdir: "{{ cape_repo_dest }}"
+        executable: /bin/bash
+      environment:
+        HOME: "/home/{{ cape_username }}"
+        PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
+
+    - name: Verify libvirt reachability as CAPE user
+      become_user: "{{ cape_username }}"
+      ansible.builtin.shell: "/usr/bin/virsh -c qemu:///system list --all"
+      register: _virsh_check
+      changed_when: false
+      failed_when: false
+      args:
+        executable: /bin/bash
+      environment:
+        HOME: "/home/{{ cape_username }}"
+
+    # ---- systemd units ----
+    # cape2.sh base creates cape.service, cape-processor.service,
+    # cape-web.service and cape-rooter.service. Check if they exist.
+    # If any are missing (older cape2.sh version), create fallback units
+    # that use `poetry run python` as the launcher.
+
+    - name: Stat units created by cape2.sh
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/{{ item }}"
+      register: _unit_stat
+      loop:
+        - cape.service
+        - cape-processor.service
+        - cape-web.service
+        - cape-rooter.service
+
+    - name: Install cape.service fallback (only if cape2.sh did not create it)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cape.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=CAPE
+          After=network-online.target postgresql.service mongodb.service libvirtd.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ cape_username }}
+          Group={{ cape_username }}
+          WorkingDirectory={{ cape_repo_dest }}
+          Environment=HOME=/home/{{ cape_username }}
+          Environment=PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring
+          ExecStart={{ cape_poetry_run }} python {{ cape_repo_dest }}/cuckoo.py
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      when: not (_unit_stat.results | selectattr('item','eq','cape.service') | map(attribute='stat.exists') | first | default(false))
+      notify: reload systemd
+
+    - name: Install cape-processor.service fallback (only if cape2.sh did not create it)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cape-processor.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=CAPE report processor
+          After=network-online.target postgresql.service mongodb.service libvirtd.service cape.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ cape_username }}
+          Group={{ cape_username }}
+          WorkingDirectory={{ cape_repo_dest }}
+          Environment=HOME=/home/{{ cape_username }}
+          Environment=PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring
+          ExecStart={{ cape_poetry_run }} python {{ cape_repo_dest }}/utils/process.py -p7 auto -pt 900
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      when: not (_unit_stat.results | selectattr('item','eq','cape-processor.service') | map(attribute='stat.exists') | first | default(false))
+      notify: reload systemd
+
+    - name: Install cape-web.service fallback (only if cape2.sh did not create it)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cape-web.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=CAPE web interface
+          After=network-online.target postgresql.service mongodb.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ cape_username }}
+          Group={{ cape_username }}
+          WorkingDirectory={{ cape_repo_dest }}/web
+          Environment=HOME=/home/{{ cape_username }}
+          Environment=PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring
+          ExecStart={{ cape_poetry_run }} python {{ cape_repo_dest }}/web/manage.py runserver_plus 0.0.0.0:8000 --traceback --keep-meta-shutdown
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      when: not (_unit_stat.results | selectattr('item','eq','cape-web.service') | map(attribute='stat.exists') | first | default(false))
+      notify: reload systemd
+
+    - name: Stat cape-rooter service unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/cape-rooter.service
+      register: _rooter_unit
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start cape services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - cape.service
+        - cape-processor.service
+        - cape-web.service
+      failed_when: false
+
+    - name: Enable and start cape-rooter if installed
+      ansible.builtin.systemd:
+        name: cape-rooter.service
+        enabled: true
+        state: started
+      when: _rooter_unit.stat.exists
+      failed_when: false
+
+    # ---- Firewall ----
+
+    - name: UFW default deny incoming
+      community.general.ufw:
+        direction: incoming
+        policy: deny
+
+    - name: UFW allow SSH
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: UFW allow web from RFC 1918 sources
+      community.general.ufw:
+        rule: allow
+        src: "{{ item }}"
+        port: '8000'
+        proto: tcp
+      loop: "{{ cape_web_allow_sources }}"
+      when: cape_limit_web_to_rfc1918
+
+    - name: UFW enable
+      community.general.ufw:
+        state: enabled
+
+    - name: Enable fail2ban
+      ansible.builtin.systemd:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    # ---- Validation and report ----
+
+    - name: Check service statuses
+      ansible.builtin.command: "systemctl is-active {{ item }}"
+      register: _svc_status
+      changed_when: false
+      failed_when: false
+      loop:
+        - cape.service
+        - cape-processor.service
+        - cape-web.service
+        - cape-rooter.service
+
+    - name: Record CAPE git commit
+      # Run as cape user so git does not complain about dubious ownership
+      # of a repository owned by another user.
+      become: true
+      become_user: "{{ cape_username }}"
+      ansible.builtin.shell: |
+        if [[ -d "{{ cape_repo_dest }}/.git" ]]; then
+          git -C "{{ cape_repo_dest }}" log -1 --format='%H  %ci' 2>/dev/null || echo 'read failed'
+        else
+          echo 'not a git repo'
+        fi
+      register: _cape_commit
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Run CAPE startup probe
+      # Quick check that CAPE starts at all. A domain-not-found error means
+      # the host is ready; the only remaining step is creating guest VMs.
+      become_user: "{{ cape_username }}"
+      ansible.builtin.shell: |
+        timeout 10 {{ cape_poetry_run }} python {{ cape_repo_dest }}/cuckoo.py 2>&1 | head -20 || true
+      register: _startup_probe
+      changed_when: false
+      failed_when: false
+      args:
+        chdir: "{{ cape_repo_dest }}"
+        executable: /bin/bash
+      environment:
+        HOME: "/home/{{ cape_username }}"
+        PYTHON_KEYRING_BACKEND: keyring.backends.null.Keyring
+
+    - name: Write deployment report
+      ansible.builtin.copy:
+        dest: "{{ cape_report_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          CAPEv2 deployment finished {{ ansible_date_time.iso8601 }}
+
+          Host       : {{ ansible_hostname }}
+          OS         : {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Kernel     : {{ ansible_kernel }}
+          RAM        : {{ ansible_memtotal_mb }} MB
+          CPUs       : {{ ansible_processor_vcpus }}
+          IP         : {{ ansible_default_ipv4.address | default('unknown') }}
+
+          Web interface  : http://{{ ansible_default_ipv4.address | default('HOST-IP') }}:8000/
+          Analysis user  : {{ cape_username }}
+          Password file  : {{ cape_password_store }}
+          CAPE root      : {{ cape_repo_dest }}
+          kvm-qemu log   : {{ cape_kvm_log }}
+          cape2 log      : {{ cape_base_log }}
+
+          Service status:
+          {% for r in _svc_status.results %}
+            {{ '%-22s' | format(r.item) }}: {{ r.stdout }}
+          {% endfor %}
+
+          Runtime checks:
+            Python imports : {{ 'ok' if _py_check.rc == 0 else 'failed' }}
+            libvirt access : {{ 'ok' if _virsh_check.rc == 0 else 'failed' }}
+
+          CAPEv2 commit:
+            {{ _cape_commit.stdout | default('unknown') }}
+
+          Startup probe output:
+          {{ _startup_probe.stdout | default('') | indent(2) }}
+
+          Next steps (host is ready, guest VMs must be created manually):
+            1. Create analysis guest VMs. Sample scripts are bundled at
+               files/guests/win10.sh and files/guests/win11.sh.
+               The default VM names are win10 and win11.
+            2. Inside the Windows guest, install the VirtIO NetKVM driver if
+               networking is not active. The guest should receive an IP from
+               the libvirt NAT range, usually 192.168.122.x.
+            3. Prepare the guest with files/guests/cape_guest_prep.ps1. To fetch
+               the CAPE agent automatically, serve it from the host first:
+                 cd {{ cape_repo_dest }}/agent
+                 python3 -m http.server 8008 --bind 192.168.122.1
+               Then run in elevated PowerShell inside the guest:
+                 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\cape_guest_prep.ps1 -CapeHostIP 192.168.122.1 -AgentServerPort 8008
+            4. Verify the agent from the CAPE host:
+                 curl http://<GUEST_IP>:8000/
+            5. Shut down and snapshot the prepared guest, for example:
+                 virsh -c qemu:///system shutdown win10
+                 virsh -c qemu:///system snapshot-create-as win10 clean "Clean CAPE Win10 guest" --disk-only --atomic
+            6. Put local CAPE machine configuration in:
+                 {{ cape_repo_dest }}/custom/conf/kvm.conf
+               Do not edit *.conf.default files. Example:
+                 [kvm]
+                 machines = win10
+                 interface = virbr0
+                 dsn = qemu:///system
+
+                 [win10]
+                 label = win10
+                 platform = windows
+                 ip = <GUEST_IP>
+                 tags = win10
+                 snapshot = clean
+                 arch = x86
+            7. Restart services after configuration changes:
+                 systemctl restart cape cape-processor cape-web cape-rooter
+
+    - name: Check sudo user desktop directory
+      ansible.builtin.stat:
+        path: "/home/{{ _sudo_user }}/Desktop"
+      register: _desktop_stat
+      when: _sudo_user | length > 0
+
+    - name: Copy deployment report to sudo user desktop
+      ansible.builtin.copy:
+        src: "{{ cape_report_file }}"
+        dest: "/home/{{ _sudo_user }}/Desktop/CAPE_DEPLOYMENT.txt"
+        owner: "{{ _sudo_user }}"
+        group: "{{ _sudo_user }}"
+        mode: "0644"
+        remote_src: true
+      when:
+        - _sudo_user | length > 0
+        - _desktop_stat.stat.exists | default(false)
+
+    - name: Copy deployment report to sudo user home (fallback)
+      ansible.builtin.copy:
+        src: "{{ cape_report_file }}"
+        dest: "/home/{{ _sudo_user }}/CAPE_DEPLOYMENT.txt"
+        owner: "{{ _sudo_user }}"
+        group: "{{ _sudo_user }}"
+        mode: "0644"
+        remote_src: true
+      when:
+        - _sudo_user | length > 0
+        - not (_desktop_stat.stat.exists | default(false))
+
+    - name: Resolve final report path for summary
+      ansible.builtin.set_fact:
+        _final_report_path: >-
+          {%- if _sudo_user | length > 0 and _desktop_stat.stat.exists | default(false) -%}
+          /home/{{ _sudo_user }}/Desktop/CAPE_DEPLOYMENT.txt
+          {%- elif _sudo_user | length > 0 -%}
+          /home/{{ _sudo_user }}/CAPE_DEPLOYMENT.txt
+          {%- else -%}
+          {{ cape_report_file }}
+          {%- endif -%}
+
+    - name: Show completion summary
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "  CAPEv2 host deployment complete."
+          - ""
+          - "  Web interface : http://{{ ansible_default_ipv4.address | default('HOST-IP') }}:8000/"
+          - "  Analysis user : {{ cape_username }}"
+          - "  Password file : {{ cape_password_store }}"
+          - ""
+          - "  Service status:"
+          - "    cape          : {{ _svc_status.results[0].stdout | default('?') }}"
+          - "    cape-processor: {{ _svc_status.results[1].stdout | default('?') }}"
+          - "    cape-web      : {{ _svc_status.results[2].stdout | default('?') }}"
+          - "    cape-rooter   : {{ _svc_status.results[3].stdout | default('?') }}"
+          - ""
+          - "  Next step:"
+          - "    sudo reboot"
+          - ""
+          - "  After reboot, create and prepare guest VMs:"
+          - "    cd files/guests"
+          - "    sudo ./win10.sh"
+          - "    sudo ./win11.sh"
+          - "  See report for details."
