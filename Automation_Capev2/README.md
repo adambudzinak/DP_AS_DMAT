@@ -39,7 +39,7 @@ how long the libvirt and QEMU source build takes on the host.
    `/root/.cape_bootstrap_password` (mode 0600).
 4. Installs apt baseline including KVM, QEMU and Python build deps.
 5. Creates the `cape` user and adds it to the `libvirt` and `kvm` groups.
-6. Clones CAPEv2 to `/opt/CAPEv2` at a pinned commit.
+6. Clones CAPEv2 to `/opt/CAPEv2`.
 7. Runs `kvm-qemu.sh all cape` inside tmux; logs to
    `/var/log/cape-install/kvm-qemu.log`.
 8. Runs `cape2.sh base` inside tmux; logs to `/var/log/cape-install/cape.log`.
@@ -75,26 +75,45 @@ If `virsh` or `virt-install` does not work right after the playbook
 finishes, the fix is almost always a reboot. The kernel can still hold
 references to the apt KVM modules even after udev is reloaded.
 
-## Pinning the CAPE commit
+## CAPE repository version
 
-CAPE is rolling-released. The `master` branch can change several times a
-day, so the playbook pins a known-good commit:
+The deployment clones CAPEv2 from my fork:
 
 ```yaml
-cape_repo_version: dd36c30f22ae3c41293fc3d27d8a2c28f8fa8206
+cape_repo_url: "https://github.com/adambudzinak/CAPEv2.git"
+cape_repo_version: master
 ```
 
-To see recent commits before bumping the pin:
+The fork is used as the repository source, while its `master` branch currently
+tracks the upstream CAPEv2 code. On 2026-05-14, the checked CAPEv2 commit was:
+
+```text
+Commit dd36c30
+Author/committer: kevoreilly
+Message: Disguise auxiliary module: ensure launch_background_processes()
+launches 64-bit processes on both bitnesses of Python
+```
+
+The playbook intentionally uses `master` from my fork:
+
+```yaml
+cape_repo_version: master
+```
+
+This is acceptable for this deployment because, at the time of validation,
+the fork's `master` branch pointed to the tested upstream commit shown above.
+
+To verify the current commit before running the playbook:
 
 ```bash
-git ls-remote https://github.com/kevoreilly/CAPEv2.git refs/heads/master
+git ls-remote https://github.com/adambudzinak/CAPEv2.git refs/heads/master
 ```
 
-You can also point the playbook at a local CAPE release ZIP. Replace the
-`Clone CAPEv2 repository` task with `ansible.builtin.unarchive` and aim
-it at the ZIP. That gives a deployment that does not move when upstream
-moves, which matters for thesis builds or anything that needs to be
-reproducible weeks later.
+The returned commit value should begin with the verified commit value above:
+`dd36c30`. If the fork is synchronized with upstream later, `master` may move to
+a newer commit. In that case, the deployment should be tested again before
+updating this section.
+
 
 ## Files
 
