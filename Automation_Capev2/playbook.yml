@@ -15,6 +15,9 @@
 
     cape_password_store: /root/.cape_bootstrap_password
     cape_repo_url: "https://github.com/adambudzinak/CAPEv2.git"
+    # To use the current upstream CAPEv2 version instead, replace the fork URL
+    # with the original repository URL below.
+    # cape_repo_url: "https://github.com/kevoreilly/CAPEv2.git"
     cape_repo_dest: /opt/CAPEv2
     # Uses my fork's master branch.
     cape_repo_version: master # verified 2026-05-14
