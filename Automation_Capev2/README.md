@@ -82,7 +82,15 @@ The deployment clones CAPEv2 from my fork:
 ```yaml
 cape_repo_url: "https://github.com/adambudzinak/CAPEv2.git"
 cape_repo_version: master
+
+# To use the current upstream CAPEv2 version instead, replace the fork URL
+# with the original repository URL below. This may install a newer, untested
+# version if upstream master has changed.
+# cape_repo_url: "https://github.com/kevoreilly/CAPEv2.git"
+
 ```
+
+
 
 The fork is used as the repository source, while its `master` branch currently
 tracks the upstream CAPEv2 code. On 2026-05-14, the checked CAPEv2 commit was:
