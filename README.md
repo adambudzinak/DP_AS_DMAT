@@ -10,7 +10,7 @@ lab, meant for use by a faculty CSIRT team.
  
 ## Contents
  
-- [`Automation_CAPEv2/`](./Automation_CAPEv2) — Ansible wrapper for automated CAPEv2 sandbox deployment on Ubuntu
+- [`Automation_CAPEv2/`](./Automation_Capev2) — Ansible wrapper for automated CAPEv2 sandbox deployment on Ubuntu
 - [`Automation_Cuckoo3/`](./Automation_Cuckoo3) — Ansible wrapper for automated Cuckoo3 sandbox deployment on Ubuntu
 ---
  
